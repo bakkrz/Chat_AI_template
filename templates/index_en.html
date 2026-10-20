@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Chat</title>
+<!-- Link CSS-->
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+
+<aside id="side">
+  <header><button class="btn primary" id="new" style="flex:1">New conversation</button></header>
+  <div id="list"></div>
+  <footer>
+    <button class="btn sm" id="settingsBtn">API settings</button>
+    <button class="btn sm" id="export">Export</button>
+    <button class="btn sm" id="clearAll">Delete all</button>
+  </footer>
+</aside>
+
+<main>
+  <div id="top">
+    <button class="btn sm" id="menu" aria-label="Conversiantion">☰</button>
+    <h1 id="title">New conversation</h1>
+    <span id="status">checking server…</span>
+  </div>
+  <div id="msgs"><div class="wrap" id="chat"></div></div>
+  <div id="composer">
+    <div class="wrap">
+      <textarea id="input" rows="1" placeholder="Write a message. (Enter sends, Shift+Enter new line)"></textarea>
+      <button class="btn primary" id="send">Send</button>
+      <button class="btn" id="stop" hidden>Stop</button>
+    </div>
+  </div>
+</main>
+
+<dialog id="dlg">
+  <h2 style="margin:0 0 4px;font-size:18px">API settings</h2>
+  <label for="s_api">API endpoint (compatible with OpenAI)</label>
+  <input id="s_api" placeholder="http://localhost:8000/v1">
+  <div class="row">
+    <div><label for="s_model">Model name</label><input id="s_model"></div>
+    <div><label for="s_key">API key (optional)</label><input id="s_key" type="password"></div>
+  </div>
+  <div class="row">
+    <div><label for="s_temp">Temperature</label><input id="s_temp" type="number" step="0.05" min="0" max="2"></div>
+    <div><label for="s_max">Max token count</label><input id="s_max" type="number" min="16" step="16"></div>
+  </div>
+  <label for="s_sys">System prompt</label>
+  <textarea id="s_sys" rows="3"></textarea>
+  <menu>
+    <button class="btn" id="s_cancel">Cancel</button>
+    <button class="btn primary" id="s_save">Save</button>
+  </menu>
+</dialog>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const LS_CHATS = "bielik_chats_v1", LS_CFG = "bielik_cfg_v1", LS_CUR = "bielik_current_v1";
+
+/* ---------- storage (z obsługą błędów) ---------- */
+const store = {
+  get(k, d){ try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } },
+  set(k, v){ try { localStorage.setItem(k, JSON.stringify(v)); } catch(e){ console.warn("The history recording failed.", e); } }
+};
+
+const defaults = {
+  api: "http://localhost:8000/v1", model: "{{ model }}", key: "{{ key }}",
+  temperature: "{{ temperature }}", max_tokens: "{{ tokens }}",
+  system: "You are a helpful assistant. You will answer my questions. Just type your question, and I will do my best to provide an answer."
+};
+let cfg = Object.assign({}, defaults, store.get(LS_CFG, {}));
+let chats = store.get(LS_CHATS, []);
+let currentId = store.get(LS_CUR, null);
+let controller = null;
+
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+const current = () => chats.find(c => c.id === currentId);
+const save = () => { store.set(LS_CHATS, chats); store.set(LS_CUR, currentId); };
+
+/* ---------- prosty renderer Markdown (bezpieczny: najpierw escapowanie) ---------- */
+const esc = s => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+
+function inline(s){
+  const codes = [];
+  s = s.replace(/`([^`\n]+)`/g, (_, c) => { codes.push(c); return "\u0000" + (codes.length-1) + "\u0000"; });
+  s = esc(s);
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+       .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>")
+       .replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
+  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => "<code>" + esc(codes[i]) + "</code>");
+}
+
+function markdown(src){
+  const blocks = [];
+  // bloki kodu (także niedomknięty – w trakcie streamowania)
+  src = src.replace(/```([\w+#.-]*)[^\n]*\n([\s\S]*?)(```|$)/g, (_, lang, code) => {
+    blocks.push('<div class="codeblock"><div class="bar"><span>' + esc(lang || "kod") +
+      '</span><button type="button" data-copy>Copy</button></div><pre><code>' +
+      esc(code.replace(/\n$/, "")) + "</code></pre></div>");
+    return "\n\u0001" + (blocks.length-1) + "\u0001\n";
+  });
+
+  const lines = src.split("\n"); let out = "", i = 0;
+  const isTable = (a, b) => a && b && a.includes("|") && /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(b);
+  const cells = l => l.trim().replace(/^\||\|$/g, "").split("|").map(c => c.trim());
+
+  while (i < lines.length){
+    const l = lines[i];
+    let m;
+    if (!l.trim()){ i++; continue; }
+    if ((m = l.match(/^\u0001(\d+)\u0001$/))){ out += blocks[m[1]]; i++; continue; }
+    if ((m = l.match(/^(#{1,4})\s+(.*)$/))){ out += `<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`; i++; continue; }
+    if (/^\s*([-*_])\1{2,}\s*$/.test(l)){ out += "<hr>"; i++; continue; }
+    if (isTable(l, lines[i+1])){
+      const head = cells(l); i += 2; let rows = "";
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim()){ rows += "<tr>" + cells(lines[i]).map(c => "<td>"+inline(c)+"</td>").join("") + "</tr>"; i++; }
+      out += "<table><thead><tr>" + head.map(c => "<th>"+inline(c)+"</th>").join("") + "</tr></thead><tbody>" + rows + "</tbody></table>"; continue;
+    }
+    if (/^\s*>\s?/.test(l)){
+      let q = []; while (i < lines.length && /^\s*>\s?/.test(lines[i])) q.push(lines[i++].replace(/^\s*>\s?/, ""));
+      out += "<blockquote>" + inline(q.join(" ")) + "</blockquote>"; continue;
+    }
+    if (/^\s*([-*+]|\d+[.)])\s+/.test(l)){
+      const ordered = /^\s*\d+[.)]\s+/.test(l); let items = "";
+      while (i < lines.length && /^\s*([-*+]|\d+[.)])\s+/.test(lines[i])) items += "<li>" + inline(lines[i++].replace(/^\s*([-*+]|\d+[.)])\s+/, "")) + "</li>";
+      out += ordered ? "<ol>"+items+"</ol>" : "<ul>"+items+"</ul>"; continue;
+    }
+    let p = [];
+    while (i < lines.length && lines[i].trim() && !/^(#{1,4}\s|\s*>|\s*([-*+]|\d+[.)])\s|\u0001)/.test(lines[i])) p.push(lines[i++]);
+    out += "<p>" + p.map(inline).join("<br>") + "</p>";
+  }
+  return out;
+}
+
+/* ---------- UI ---------- */
+function renderList(){
+  const el = $("list"); el.innerHTML = "";
+  [...chats].sort((a,b) => b.updated - a.updated).forEach(c => {
+    const d = document.createElement("div");
+    d.className = "item" + (c.id === currentId ? " active" : "");
+    d.innerHTML = "<span></span><button title=\"I have removed the conversation.\" aria-label=\"I have removed the conversation.\">✕</button>";
+    d.firstChild.textContent = c.title;
+    d.onclick = () => { if (controller) return; currentId = c.id; save(); renderAll(); $("side").classList.remove("open"); };
+    d.lastChild.onclick = e => { e.stopPropagation(); if (controller) return;
+      chats = chats.filter(x => x.id !== c.id);
+      if (currentId === c.id) currentId = chats[0]?.id ?? null;
+      save(); renderAll(); };
+    el.appendChild(d);
+  });
+}
+
+function msgNode(role, html){
+  const m = document.createElement("div"); m.className = "msg " + role;
+  m.innerHTML = '<div class="who">' + (role === "user" ? "Ty" : "Bielik") + '</div><div class="body"></div>';
+  if (html != null) m.lastChild.innerHTML = html;
+  return m;
+}
+
+function renderChat(){
+  const chat = $("chat"); chat.innerHTML = "";
+  const c = current();
+  $("title").textContent = c ? c.title : "New conversation";
+  if (!c || !c.messages.length){
+    chat.innerHTML = '<div class="empty">Ask a question to the local model.<br>The history is saved in this browser.</div>'; return;
+  }
+  c.messages.forEach(m => chat.appendChild(msgNode(m.role, m.role === "user" ? null : markdown(m.content))));
+  chat.querySelectorAll(".msg.user .body").forEach((b, i) => b.textContent = c.messages.filter(m => m.role === "user")[i].content);
+  scrollDown(true);
+}
+const renderAll = () => { renderList(); renderChat(); };
+
+function scrollDown(force){
+  const s = $("msgs");
+  if (force || s.scrollHeight - s.scrollTop - s.clientHeight < 140) s.scrollTop = s.scrollHeight;
+}
+
+function setBusy(b){
+  $("send").hidden = b; $("stop").hidden = !b; $("input").disabled = b;
+  if (!b) $("input").focus();
+}
+
+/* ---------- komunikacja z modelem ---------- */
+async function send(){
+  const text = $("input").value.trim();
+  if (!text || controller) return;
+  let c = current();
+  if (!c){ c = { id: uid(), title: "New conversation", messages: [], updated: Date.now() }; chats.push(c); currentId = c.id; }
+  if (!c.messages.length) c.title = text.slice(0, 48) + (text.length > 48 ? "…" : "");
+  c.messages.push({ role: "user", content: text });
+  c.updated = Date.now(); save();
+  $("input").value = ""; autosize();
+  renderList(); renderChat();
+
+  const node = msgNode("assistant");
+  const body = node.lastChild;
+  const t0 = Date.now();
+  body.innerHTML = '<span class="thinking"><span class="dots"><i></i><i></i><i></i></span><span>Thinking… <span id="sec">0</span> s</span></span>';
+  $("chat").appendChild(node); scrollDown(true);
+  const tick = setInterval(() => { const s = $("sec"); if (s) s.textContent = Math.floor((Date.now() - t0) / 1000); }, 500);
+
+  controller = new AbortController(); setBusy(true);
+  let answer = "", failed = null;
+
+  const payload = {
+    model: cfg.model, stream: true,
+    temperature: Number(cfg.temperature), max_tokens: Number(cfg.max_tokens),
+    messages: [
+      ...(cfg.system.trim() ? [{ role: "system", content: cfg.system.trim() }] : []),
+      ...c.messages.map(({ role, content }) => ({ role, content }))
+    ]
+  };
+
+  try {
+    const headers = { "Content-Type": "application/json" };
+    if (cfg.key) headers.Authorization = "Bearer " + cfg.key;
+    const r = await fetch(cfg.api.replace(/\/$/, "") + "/chat/completions",
+      { method: "POST", headers, body: JSON.stringify(payload), signal: controller.signal });
+    if (!r.ok) throw new Error("The server has returned " + r.status + ": " + (await r.text()).slice(0, 300));
+
+    const ct = r.headers.get("content-type") || "";
+    if (ct.includes("text/event-stream")){
+      const reader = r.body.getReader(), dec = new TextDecoder(); let buf = "";
+      for (;;){
+        const { value, done } = await reader.read(); if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const parts = buf.split("\n"); buf = parts.pop();
+        for (const line of parts){
+          if (!line.startsWith("data:")) continue;
+          const d = line.slice(5).trim(); if (!d || d === "[DONE]") continue;
+          try {
+            const delta = JSON.parse(d).choices?.[0]?.delta?.content;
+            if (delta){
+              if (!answer) clearInterval(tick);
+              answer += delta; body.innerHTML = markdown(answer); scrollDown();
+            }
+          } catch {}
+        }
+      }
+    } else {
+      const j = await r.json();
+      answer = j.choices?.[0]?.message?.content ?? "";
+      body.innerHTML = markdown(answer);
+    }
+    if (!answer.trim()) failed = "The model has returned an empty response.";
+  } catch (e){
+    if (e.name === "AbortError") { if (!answer) failed = "Przerwano."; }
+    else failed = e.message === "Failed to fetch"
+      ? "The connection with the server is not established. Check if the model is working at the address specified in the settings and if the server allows for CORS."
+      : e.message;
+  } finally {
+    clearInterval(tick); controller = null; setBusy(false);
+  }
+
+  if (answer.trim()) c.messages.push({ role: "assistant", content: answer });
+  if (failed){
+    body.innerHTML = (answer ? markdown(answer) : "") + '<p class="err">' + esc(failed) + "</p>";
+    if (!answer) c.messages.pop();   
+    if (!answer) { $("input").value = text; autosize(); }
+  }
+  c.updated = Date.now(); save(); renderList();
+}
+
+async function ping(){
+  const s = $("status");
+  try {
+    const r = await fetch(cfg.api.replace(/\/$/, "") + "/models", { signal: AbortSignal.timeout(3000) });
+    if (!r.ok) throw 0;
+    s.textContent = "The server is functioning."; s.className = "ok";
+  } catch { s.textContent = "The connection is not established."; s.className = "bad"; }
+}
+
+/* ---------- zdarzenia ---------- */
+function autosize(){ const t = $("input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 200) + "px"; }
+$("input").addEventListener("input", autosize);
+$("input").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing){ e.preventDefault(); send(); } });
+$("send").onclick = send;
+$("stop").onclick = () => controller?.abort();
+$("new").onclick = () => { if (controller) return; currentId = null; save(); renderAll(); $("side").classList.remove("open"); $("input").focus(); };
+$("menu").onclick = () => $("side").classList.toggle("open");
+$("clearAll").onclick = () => { if (!controller && confirm("Delete all stored conversations?")){ chats = []; currentId = null; save(); renderAll(); } };
+$("export").onclick = () => {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(chats, null, 2)], { type: "application/json" }));
+  a.download = "ai-model-history.json"; a.click(); URL.revokeObjectURL(a.href);
+};
+$("chat").addEventListener("click", e => {
+  const b = e.target.closest("[data-copy]"); if (!b) return;
+  const code = b.closest(".codeblock").querySelector("code").textContent;
+  navigator.clipboard.writeText(code).then(() => { b.textContent = "The content has been copied."; setTimeout(() => b.textContent = "Copy", 1500); });
+});
+
+const dlg = $("dlg");
+$("settingsBtn").onclick = () => {
+  $("s_api").value = cfg.api; $("s_model").value = cfg.model; $("s_key").value = cfg.key;
+  $("s_temp").value = cfg.temperature; $("s_max").value = cfg.max_tokens; $("s_sys").value = cfg.system;
+  dlg.showModal();
+};
+$("s_cancel").onclick = () => dlg.close();
+$("s_save").onclick = () => {
+  cfg = { api: $("s_api").value.trim() || defaults.api, model: $("s_model").value.trim() || defaults.model,
+    key: $("s_key").value, temperature: $("s_temp").value || defaults.temperature,
+    max_tokens: $("s_max").value || defaults.max_tokens, system: $("s_sys").value };
+  store.set(LS_CFG, cfg); dlg.close(); ping();
+};
+
+if (!current()) currentId = null;
+renderAll(); ping(); setInterval(ping, 15000);
+</script>
+</body>
+</html>
