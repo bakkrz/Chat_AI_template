@@ -14,7 +14,8 @@ import os
 server_model = os.getenv('SERVER_MODEL','http://localhost:8000/v1')
 server_ip = os.getenv('SERVER_LOCAL_IP','127.0.0.1')
 server_port =  os.getenv('SERVER_LOCAL_PORT','8800')
-system="Jesteś pomocnym asystentem. Odpowiadaj po polsku, zwięźle i rzeczowo. Kod umieszczaj w blokach markdown."
+system_pl="Jesteś pomocnym asystentem. Odpowiadaj po polsku, zwięźle i rzeczowo. Kod umieszczaj w blokach markdown."
+system_en="I am a helpful assistant. I will answer your questions. Just type your question, and I will do my best to provide an answer."
 model_name="Bielik-7B-v0.1"
 key=""
 temperature = 0.3
@@ -31,7 +32,7 @@ def index():
                            server_model=server_model,
                            ip=server_ip,
                            port=server_port,
-                           system=system,
+                           system=system_en,
                            model=model_name,
                            key=key,
                            temperature=temperature,
